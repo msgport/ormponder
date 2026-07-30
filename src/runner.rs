@@ -404,16 +404,16 @@ where
             })?;
 
         let progress = batch_progress(range, target_block, next_block, batch_started.elapsed());
-        crate::metrics::record_range_success(
-            chain.chain_id,
+        crate::metrics::record_range_success(crate::metrics::RangeSuccessMetrics {
+            chain_id: chain.chain_id,
             dataset,
-            progress.batch_blocks,
-            records_read as u64,
-            events.len() as u64,
-            written as u64,
-            progress.remaining_blocks,
-            batch_started.elapsed().as_secs_f64(),
-        );
+            blocks_processed: progress.batch_blocks,
+            records_read: records_read as u64,
+            records_decoded: events.len() as u64,
+            records_written: written as u64,
+            remaining_blocks: progress.remaining_blocks,
+            duration_seconds: batch_started.elapsed().as_secs_f64(),
+        });
         log::info!(
             "ORMP Datalens batch completed chain_id={} dataset={} from_block={} to_block={} target_block={} records_count={} decoded_count={} written_count={} checkpoint_next_block={} checkpoint_advanced=true batch_blocks={} remaining_blocks={} batch_duration_ms={} current_rate_blocks_per_second={:.2} eta_seconds={}",
             chain.chain_id,

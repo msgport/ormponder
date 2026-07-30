@@ -51,6 +51,17 @@ pub struct MetricsSnapshot {
     pub runtime_rows: Vec<RuntimeMetricsRow>,
 }
 
+pub struct RangeSuccessMetrics<'a> {
+    pub chain_id: u64,
+    pub dataset: &'a str,
+    pub blocks_processed: u64,
+    pub records_read: u64,
+    pub records_decoded: u64,
+    pub records_written: u64,
+    pub remaining_blocks: u64,
+    pub duration_seconds: f64,
+}
+
 #[derive(Clone, Debug, Default)]
 struct MetricsState {
     configured_scopes: BTreeMap<MetricsScopeKey, ConfiguredScopeMetricsRow>,
@@ -123,27 +134,24 @@ pub fn record_remaining_blocks(chain_id: u64, dataset: &str, remaining_blocks: u
     row.remaining_blocks = Some(remaining_blocks);
 }
 
-pub fn record_range_success(
-    chain_id: u64,
-    dataset: &str,
-    blocks_processed: u64,
-    records_read: u64,
-    records_decoded: u64,
-    records_written: u64,
-    remaining_blocks: u64,
-    duration_seconds: f64,
-) {
-    let row = runtime_row(chain_id, dataset);
+pub fn record_range_success(metrics: RangeSuccessMetrics<'_>) {
+    let row = runtime_row(metrics.chain_id, metrics.dataset);
     let mut state = metrics_state().lock().expect("ORMP metrics mutex");
     let row = state.runtime_rows.entry(row.0).or_insert(row.1);
     row.ranges_success_total = row.ranges_success_total.saturating_add(1);
-    row.blocks_processed_total = row.blocks_processed_total.saturating_add(blocks_processed);
-    row.records_read_total = row.records_read_total.saturating_add(records_read);
-    row.records_decoded_total = row.records_decoded_total.saturating_add(records_decoded);
-    row.records_written_total = row.records_written_total.saturating_add(records_written);
-    row.batch_duration_seconds_sum += duration_seconds;
+    row.blocks_processed_total = row
+        .blocks_processed_total
+        .saturating_add(metrics.blocks_processed);
+    row.records_read_total = row.records_read_total.saturating_add(metrics.records_read);
+    row.records_decoded_total = row
+        .records_decoded_total
+        .saturating_add(metrics.records_decoded);
+    row.records_written_total = row
+        .records_written_total
+        .saturating_add(metrics.records_written);
+    row.batch_duration_seconds_sum += metrics.duration_seconds;
     row.batch_duration_seconds_count = row.batch_duration_seconds_count.saturating_add(1);
-    row.remaining_blocks = Some(remaining_blocks);
+    row.remaining_blocks = Some(metrics.remaining_blocks);
     row.checkpoint_last_forward_advance_timestamp_seconds = Some(unix_timestamp_seconds());
 }
 
