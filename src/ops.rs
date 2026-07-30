@@ -1,5 +1,16 @@
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
+
 use serde::Serialize;
 use sqlx::{FromRow, PgPool};
+use tokio::{
+    sync::{Mutex, RwLock},
+    time,
+};
+
+use crate::config::MetricsConfig;
 
 const LEGACY_TABLES: &[&str] = &[
     "ormp_hash_imported",
@@ -46,6 +57,169 @@ pub struct DatasetProgressRow {
 pub struct LegacyTableRowCount {
     pub table_name: String,
     pub row_count: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct DbMetricsSnapshot {
+    checkpoints: Vec<CheckpointRow>,
+    row_counts: Vec<LegacyTableRowCount>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct MetricsCacheStatus {
+    last_success_timestamp_seconds: Option<f64>,
+    snapshot_age_seconds: Option<f64>,
+    last_refresh_duration_seconds: Option<f64>,
+    last_refresh_success: bool,
+    refresh_errors_total: u64,
+    stale: bool,
+}
+
+impl MetricsCacheStatus {
+    fn for_direct_render() -> Self {
+        Self {
+            last_success_timestamp_seconds: None,
+            snapshot_age_seconds: None,
+            last_refresh_duration_seconds: None,
+            last_refresh_success: true,
+            refresh_errors_total: 0,
+            stale: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetricsCacheState {
+    snapshot: Option<DbMetricsSnapshot>,
+    last_success_at: Option<Instant>,
+    last_success_timestamp_seconds: Option<f64>,
+    last_refresh_duration_seconds: Option<f64>,
+    last_refresh_success: bool,
+    refresh_errors_total: u64,
+    last_error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MetricsCache {
+    state: Arc<RwLock<MetricsCacheState>>,
+    refresh_lock: Arc<Mutex<()>>,
+    refresh_delay: std::time::Duration,
+    refresh_timeout: std::time::Duration,
+    stale_after: std::time::Duration,
+}
+
+impl MetricsCache {
+    pub fn new(config: MetricsConfig) -> Self {
+        Self {
+            state: Arc::new(RwLock::new(MetricsCacheState {
+                last_refresh_success: true,
+                ..Default::default()
+            })),
+            refresh_lock: Arc::new(Mutex::new(())),
+            refresh_delay: config.refresh_delay,
+            refresh_timeout: config.refresh_timeout,
+            stale_after: config.refresh_delay * 3,
+        }
+    }
+
+    pub fn spawn_refresh_loop(&self, pool: PgPool) {
+        let cache = self.clone();
+        tokio::spawn(async move {
+            loop {
+                cache.refresh(&pool, true).await;
+                time::sleep(cache.refresh_delay).await;
+            }
+        });
+    }
+
+    pub async fn render(&self, pool: &PgPool) -> anyhow::Result<String> {
+        if self.state.read().await.snapshot.is_none() {
+            self.refresh(pool, false).await;
+        }
+
+        let (snapshot, status, last_error) = self.snapshot().await;
+        match snapshot {
+            Some(snapshot) => Ok(format_metrics_with_status(
+                &snapshot.checkpoints,
+                &snapshot.row_counts,
+                &crate::metrics::snapshot(),
+                &status,
+            )),
+            None => Err(anyhow::anyhow!(
+                "metrics snapshot unavailable{}",
+                last_error
+                    .map(|error| format!(": {error}"))
+                    .unwrap_or_default()
+            )),
+        }
+    }
+
+    async fn refresh(&self, pool: &PgPool, force: bool) {
+        let _guard = self.refresh_lock.lock().await;
+        if !force && self.state.read().await.snapshot.is_some() {
+            return;
+        }
+
+        let started_at = Instant::now();
+        let result = time::timeout(self.refresh_timeout, collect_db_metrics_snapshot(pool)).await;
+        match result {
+            Ok(Ok(snapshot)) => {
+                let mut state = self.state.write().await;
+                state.snapshot = Some(snapshot);
+                state.last_success_at = Some(Instant::now());
+                state.last_success_timestamp_seconds = Some(unix_timestamp_seconds());
+                state.last_refresh_duration_seconds = Some(started_at.elapsed().as_secs_f64());
+                state.last_refresh_success = true;
+                state.last_error = None;
+            }
+            Ok(Err(error)) => {
+                self.record_refresh_failure(started_at, error.to_string())
+                    .await;
+            }
+            Err(_) => {
+                self.record_refresh_failure(
+                    started_at,
+                    format!(
+                        "collect ORMP indexer metrics exceeded {}s timeout",
+                        self.refresh_timeout.as_secs_f64()
+                    ),
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn record_refresh_failure(&self, started_at: Instant, error: String) {
+        let mut state = self.state.write().await;
+        state.last_refresh_duration_seconds = Some(started_at.elapsed().as_secs_f64());
+        state.last_refresh_success = false;
+        state.refresh_errors_total = state.refresh_errors_total.saturating_add(1);
+        state.last_error = Some(error);
+    }
+
+    async fn snapshot(
+        &self,
+    ) -> (
+        Option<DbMetricsSnapshot>,
+        MetricsCacheStatus,
+        Option<String>,
+    ) {
+        let state = self.state.read().await;
+        let snapshot_age_seconds = state
+            .last_success_at
+            .map(|last_success_at| last_success_at.elapsed().as_secs_f64());
+        let status = MetricsCacheStatus {
+            last_success_timestamp_seconds: state.last_success_timestamp_seconds,
+            snapshot_age_seconds,
+            last_refresh_duration_seconds: state.last_refresh_duration_seconds,
+            last_refresh_success: state.last_refresh_success,
+            refresh_errors_total: state.refresh_errors_total,
+            stale: snapshot_age_seconds
+                .map(|age| age > self.stale_after.as_secs_f64())
+                .unwrap_or(true),
+        };
+        (state.snapshot.clone(), status, state.last_error.clone())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -116,6 +290,16 @@ pub async fn load_status(pool: &PgPool) -> anyhow::Result<StatusResponse> {
 }
 
 pub async fn render_metrics(pool: &PgPool) -> anyhow::Result<String> {
+    let snapshot = collect_db_metrics_snapshot(pool).await?;
+    Ok(format_metrics_with_status(
+        &snapshot.checkpoints,
+        &snapshot.row_counts,
+        &crate::metrics::snapshot(),
+        &MetricsCacheStatus::for_direct_render(),
+    ))
+}
+
+async fn collect_db_metrics_snapshot(pool: &PgPool) -> anyhow::Result<DbMetricsSnapshot> {
     let checkpoints = sqlx::query_as::<_, CheckpointRow>(
         "SELECT
             chain_id::TEXT AS chain_id,
@@ -150,19 +334,86 @@ pub async fn render_metrics(pool: &PgPool) -> anyhow::Result<String> {
     .fetch_all(pool)
     .await?;
 
-    Ok(format_metrics(
-        &checkpoints,
-        &row_counts,
-        &crate::metrics::snapshot(),
-    ))
+    Ok(DbMetricsSnapshot {
+        checkpoints,
+        row_counts,
+    })
 }
 
+#[cfg(test)]
 fn format_metrics(
     checkpoints: &[CheckpointRow],
     row_counts: &[LegacyTableRowCount],
     runtime: &crate::metrics::MetricsSnapshot,
 ) -> String {
+    format_metrics_with_status(
+        checkpoints,
+        row_counts,
+        runtime,
+        &MetricsCacheStatus::for_direct_render(),
+    )
+}
+
+fn format_metrics_with_status(
+    checkpoints: &[CheckpointRow],
+    row_counts: &[LegacyTableRowCount],
+    runtime: &crate::metrics::MetricsSnapshot,
+    cache_status: &MetricsCacheStatus,
+) -> String {
     let mut body = String::new();
+
+    body.push_str("# HELP ormp_metrics_snapshot_last_success_timestamp_seconds Unix timestamp of the last successful DB-backed ORMP metrics snapshot refresh.\n");
+    body.push_str("# TYPE ormp_metrics_snapshot_last_success_timestamp_seconds gauge\n");
+    body.push_str("# HELP ormp_metrics_snapshot_age_seconds Seconds since the last successful DB-backed ORMP metrics snapshot refresh.\n");
+    body.push_str("# TYPE ormp_metrics_snapshot_age_seconds gauge\n");
+    body.push_str("# HELP ormp_metrics_refresh_duration_seconds Duration of the most recent DB-backed ORMP metrics snapshot refresh.\n");
+    body.push_str("# TYPE ormp_metrics_refresh_duration_seconds gauge\n");
+    body.push_str("# HELP ormp_metrics_refresh_success Whether the most recent DB-backed ORMP metrics snapshot refresh succeeded.\n");
+    body.push_str("# TYPE ormp_metrics_refresh_success gauge\n");
+    body.push_str("# HELP ormp_metrics_refresh_errors_total Failed DB-backed ORMP metrics snapshot refresh attempts.\n");
+    body.push_str("# TYPE ormp_metrics_refresh_errors_total counter\n");
+    body.push_str("# HELP ormp_metrics_snapshot_stale Whether the DB-backed ORMP metrics snapshot is older than the configured freshness threshold.\n");
+    body.push_str("# TYPE ormp_metrics_snapshot_stale gauge\n");
+    append_optional_metric(
+        &mut body,
+        "ormp_metrics_snapshot_last_success_timestamp_seconds",
+        &[],
+        cache_status.last_success_timestamp_seconds,
+    );
+    append_optional_metric(
+        &mut body,
+        "ormp_metrics_snapshot_age_seconds",
+        &[],
+        cache_status.snapshot_age_seconds,
+    );
+    append_optional_metric(
+        &mut body,
+        "ormp_metrics_refresh_duration_seconds",
+        &[],
+        cache_status.last_refresh_duration_seconds,
+    );
+    append_metric(
+        &mut body,
+        "ormp_metrics_refresh_success",
+        &[],
+        if cache_status.last_refresh_success {
+            1_u64
+        } else {
+            0_u64
+        },
+    );
+    append_metric(
+        &mut body,
+        "ormp_metrics_refresh_errors_total",
+        &[],
+        cache_status.refresh_errors_total,
+    );
+    append_metric(
+        &mut body,
+        "ormp_metrics_snapshot_stale",
+        &[],
+        if cache_status.stale { 1_u64 } else { 0_u64 },
+    );
 
     body.push_str(
         "# HELP ormp_indexer_checkpoint_next_block Next block recorded per chain and dataset.\n",
@@ -412,6 +663,13 @@ fn format_metrics(
     }
 
     body
+}
+
+fn unix_timestamp_seconds() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn append_datalens_request_metrics(body: &mut String, row: &crate::metrics::RuntimeMetricsRow) {

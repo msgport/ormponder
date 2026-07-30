@@ -104,6 +104,8 @@ fn test_runtime_config_from_env_map_reads_datalens_database_and_chain_settings()
     assert_eq!(config.start_block, 1000);
     assert_eq!(config.finality_mode, FinalityMode::Durable);
     assert_eq!(config.reorg_window_blocks, 128);
+    assert_eq!(config.metrics.refresh_delay, Duration::from_secs(5));
+    assert_eq!(config.metrics.refresh_timeout, Duration::from_secs(10));
     assert!(config.warmup.enabled);
     assert!(!config.warmup.ensure_on_startup);
     assert!(config.warmup.required);
@@ -127,6 +129,88 @@ fn test_runtime_config_from_env_map_reads_datalens_database_and_chain_settings()
     assert_eq!(
         config.chain(46).expect("chain 46").finality_mode,
         FinalityMode::Durable
+    );
+}
+
+#[test]
+fn test_runtime_config_reads_metrics_cache_settings() {
+    let env = BTreeMap::from([
+        (
+            "ORMPINDEXER_DATALENS_ENDPOINT".to_owned(),
+            "https://datalens.example".to_owned(),
+        ),
+        (
+            "ORMPINDEXER_DATALENS_APPLICATION".to_owned(),
+            "ormp-production".to_owned(),
+        ),
+        ("ORMPINDEXER_ENABLED_CHAINS".to_owned(), "46".to_owned()),
+        (
+            "ORMPINDEXER_METRICS_REFRESH_DELAY_MS".to_owned(),
+            "3000".to_owned(),
+        ),
+        (
+            "ORMPINDEXER_METRICS_REFRESH_TIMEOUT_MS".to_owned(),
+            "7000".to_owned(),
+        ),
+    ]);
+
+    let config = RuntimeConfig::from_env_map(&env).expect("config parses");
+
+    assert_eq!(config.metrics.refresh_delay, Duration::from_secs(3));
+    assert_eq!(config.metrics.refresh_timeout, Duration::from_secs(7));
+}
+
+#[test]
+fn test_runtime_config_rejects_zero_metrics_refresh_delay() {
+    let env = BTreeMap::from([
+        (
+            "ORMPINDEXER_DATALENS_ENDPOINT".to_owned(),
+            "https://datalens.example".to_owned(),
+        ),
+        (
+            "ORMPINDEXER_DATALENS_APPLICATION".to_owned(),
+            "ormp-production".to_owned(),
+        ),
+        ("ORMPINDEXER_ENABLED_CHAINS".to_owned(), "46".to_owned()),
+        (
+            "ORMPINDEXER_METRICS_REFRESH_DELAY_MS".to_owned(),
+            "0".to_owned(),
+        ),
+    ]);
+
+    let error = RuntimeConfig::from_env_map(&env).expect_err("zero refresh delay is invalid");
+
+    assert!(
+        error
+            .to_string()
+            .contains("ORMPINDEXER_METRICS_REFRESH_DELAY_MS must be greater than zero")
+    );
+}
+
+#[test]
+fn test_runtime_config_rejects_zero_metrics_refresh_timeout() {
+    let env = BTreeMap::from([
+        (
+            "ORMPINDEXER_DATALENS_ENDPOINT".to_owned(),
+            "https://datalens.example".to_owned(),
+        ),
+        (
+            "ORMPINDEXER_DATALENS_APPLICATION".to_owned(),
+            "ormp-production".to_owned(),
+        ),
+        ("ORMPINDEXER_ENABLED_CHAINS".to_owned(), "46".to_owned()),
+        (
+            "ORMPINDEXER_METRICS_REFRESH_TIMEOUT_MS".to_owned(),
+            "0".to_owned(),
+        ),
+    ]);
+
+    let error = RuntimeConfig::from_env_map(&env).expect_err("zero refresh timeout is invalid");
+
+    assert!(
+        error
+            .to_string()
+            .contains("ORMPINDEXER_METRICS_REFRESH_TIMEOUT_MS must be greater than zero")
     );
 }
 

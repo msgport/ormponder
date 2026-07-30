@@ -2,9 +2,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 use ormpindexer::{
-    config::RuntimeConfig,
+    config::{MetricsConfig, RuntimeConfig},
     database,
-    graphql::{build_router, build_schema},
+    graphql::{build_router_with_metrics_config, build_schema},
     runtime::{migrate, run, run_with_server},
 };
 
@@ -53,7 +53,8 @@ async fn serve(listen_addr: &str) -> anyhow::Result<()> {
     let database_url = RuntimeConfig::database_url_from_env()?;
     let pool = database::connect(&database_url, 5).await?;
     database::apply_migrations(&pool).await?;
-    let app = build_router(build_schema(pool.clone()), pool);
+    let metrics_config = MetricsConfig::from_env()?;
+    let app = build_router_with_metrics_config(build_schema(pool.clone()), pool, metrics_config);
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("bind GraphQL server to {listen_addr}"))?;

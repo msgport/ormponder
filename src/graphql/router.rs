@@ -12,7 +12,7 @@ use sqlx::PgPool;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::QueryRoot;
-use crate::ops;
+use crate::{config::MetricsConfig, ops};
 
 pub type IndexerGraphqlSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
 
@@ -23,6 +23,17 @@ pub fn build_schema(pool: PgPool) -> IndexerGraphqlSchema {
 }
 
 pub fn build_router(schema: IndexerGraphqlSchema, pool: PgPool) -> Router {
+    build_router_with_metrics_config(schema, pool, MetricsConfig::default())
+}
+
+pub fn build_router_with_metrics_config(
+    schema: IndexerGraphqlSchema,
+    pool: PgPool,
+    metrics_config: MetricsConfig,
+) -> Router {
+    let metrics_cache = ops::MetricsCache::new(metrics_config);
+    metrics_cache.spawn_refresh_loop(pool.clone());
+
     Router::new()
         .route("/healthz", get(healthz_handler))
         .route("/readyz", get(readyz_handler))
@@ -30,7 +41,11 @@ pub fn build_router(schema: IndexerGraphqlSchema, pool: PgPool) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/graphql", post(graphql_handler))
         .route("/graphiql", get(graphql_graphiql))
-        .with_state(HttpState { schema, pool })
+        .with_state(HttpState {
+            schema,
+            pool,
+            metrics_cache,
+        })
         .layer(cors_layer())
 }
 
@@ -75,7 +90,7 @@ async fn status_handler(State(state): State<HttpState>) -> impl IntoResponse {
 }
 
 async fn metrics_handler(State(state): State<HttpState>) -> impl IntoResponse {
-    match ops::render_metrics(&state.pool).await {
+    match state.metrics_cache.render(&state.pool).await {
         Ok(metrics) => (
             [(
                 CONTENT_TYPE,
@@ -128,4 +143,5 @@ pub(super) struct GraphqlState {
 struct HttpState {
     schema: IndexerGraphqlSchema,
     pool: PgPool,
+    metrics_cache: ops::MetricsCache,
 }
