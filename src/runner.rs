@@ -135,12 +135,23 @@ where
             match self.run_chain_once(chain.clone()).await {
                 Ok(report) => {
                     consecutive_failures = 0;
+                    if let Ok(dataset) = chain_dataset(chain.chain_id) {
+                        crate::metrics::record_chain_pass(chain.chain_id, dataset, true, 0);
+                    }
                     if should_sleep_after_report(&report) {
                         sleep(self.config.poll_interval).await;
                     }
                 }
                 Err(error) => {
                     consecutive_failures += 1;
+                    if let Ok(dataset) = chain_dataset(chain.chain_id) {
+                        crate::metrics::record_chain_pass(
+                            chain.chain_id,
+                            dataset,
+                            false,
+                            consecutive_failures,
+                        );
+                    }
                     let backoff = failure_backoff(self.config.poll_interval, consecutive_failures);
                     log::error!(
                         "ORMP Datalens chain pass failed chain_id={} start_block={} consecutive_failures={} backoff_ms={} error={:#}",
@@ -198,7 +209,9 @@ where
             .await
             .with_context(|| format!("query Datalens chain head for chain {}", chain.chain_id))?;
         let target_block = latest_block.saturating_sub(self.config.datalens.head_buffer_blocks);
+        crate::metrics::record_chain_head(chain.chain_id, dataset, latest_block, target_block);
         if checkpoint.next_block > target_block {
+            crate::metrics::record_remaining_blocks(chain.chain_id, dataset, 0);
             log::info!(
                 "skipping ORMP Datalens chain_id={} dataset={} checkpoint_next_block={} target_block={} latest_block={} head_buffer_blocks={} checkpoint_ahead_of_target=true",
                 chain.chain_id,
@@ -256,8 +269,12 @@ where
             log_query_start(chain, dataset, range, target_block);
             let batch_started = Instant::now();
             let result = match self.query_range_once(chain, dataset, range).await {
-                Ok(result) => result,
+                Ok(result) => {
+                    crate::metrics::record_datalens_request(chain.chain_id, dataset, "logs", true);
+                    result
+                }
                 Err(error) => {
+                    crate::metrics::record_datalens_request(chain.chain_id, dataset, "logs", false);
                     if can_split_datalens_query_failure(&error, range) {
                         let (left, right) = split_range(range);
                         log::warn!(
@@ -277,6 +294,7 @@ where
                         continue;
                     }
 
+                    crate::metrics::record_range_failure(chain.chain_id, dataset);
                     return Err(error);
                 }
             };
@@ -386,6 +404,16 @@ where
             })?;
 
         let progress = batch_progress(range, target_block, next_block, batch_started.elapsed());
+        crate::metrics::record_range_success(crate::metrics::RangeSuccessMetrics {
+            chain_id: chain.chain_id,
+            dataset,
+            blocks_processed: progress.batch_blocks,
+            records_read: records_read as u64,
+            records_decoded: events.len() as u64,
+            records_written: written as u64,
+            remaining_blocks: progress.remaining_blocks,
+            duration_seconds: batch_started.elapsed().as_secs_f64(),
+        });
         log::info!(
             "ORMP Datalens batch completed chain_id={} dataset={} from_block={} to_block={} target_block={} records_count={} decoded_count={} written_count={} checkpoint_next_block={} checkpoint_advanced=true batch_blocks={} remaining_blocks={} batch_duration_ms={} current_rate_blocks_per_second={:.2} eta_seconds={}",
             chain.chain_id,
@@ -440,15 +468,23 @@ where
 
         let mut transactions = Vec::new();
         for block_number in sender_blocks {
+            let result = self
+                .reader
+                .query_transactions(DatalensTransactionQuery {
+                    chain_id: chain.chain_id,
+                    from_block: block_number,
+                    to_block: block_number,
+                    finality_mode: chain.finality_mode,
+                })
+                .await;
+            crate::metrics::record_datalens_request(
+                chain.chain_id,
+                chain_dataset(chain.chain_id).unwrap_or("unknown"),
+                "transactions",
+                result.is_ok(),
+            );
             transactions.extend(
-                self.reader
-                    .query_transactions(DatalensTransactionQuery {
-                        chain_id: chain.chain_id,
-                        from_block: block_number,
-                        to_block: block_number,
-                        finality_mode: chain.finality_mode,
-                    })
-                    .await
+                result
                     .with_context(|| {
                         format!(
                             "query ORMP Datalens transactions chain_id={} block_number={}",
@@ -503,7 +539,7 @@ where
             .into_iter()
             .map(|anchor| (anchor.block_number, anchor))
             .collect::<BTreeMap<_, _>>();
-        let current_blocks = self
+        let current_blocks_result = self
             .reader
             .query_blocks(DatalensBlockQuery {
                 chain_id: chain.chain_id,
@@ -511,8 +547,14 @@ where
                 to_block,
                 finality_mode: chain.finality_mode,
             })
-            .await
-            .with_context(|| {
+            .await;
+        crate::metrics::record_datalens_request(
+            chain.chain_id,
+            dataset,
+            "blocks",
+            current_blocks_result.is_ok(),
+        );
+        let current_blocks = current_blocks_result.with_context(|| {
                 format!(
                     "query ORMP Datalens reorg block anchors chain_id={} dataset={} from_block={} to_block={}",
                     chain.chain_id, dataset, from_block, to_block
@@ -553,6 +595,7 @@ where
                     chain.chain_id, dataset, rollback_block
                 )
             })?;
+        crate::metrics::record_reorg_rollback(chain.chain_id, dataset);
         Ok(Some(rollback_block))
     }
 
@@ -572,7 +615,7 @@ where
             ));
         }
 
-        let blocks = self
+        let blocks_result = self
             .reader
             .query_blocks(DatalensBlockQuery {
                 chain_id: chain.chain_id,
@@ -580,8 +623,14 @@ where
                 to_block: range.to_block,
                 finality_mode: chain.finality_mode,
             })
-            .await
-            .with_context(|| {
+            .await;
+        crate::metrics::record_datalens_request(
+            chain.chain_id,
+            dataset,
+            "blocks",
+            blocks_result.is_ok(),
+        );
+        let blocks = blocks_result.with_context(|| {
                 format!(
                     "query ORMP Datalens block anchors chain_id={} dataset={} from_block={} to_block={}",
                     chain.chain_id, dataset, range.from_block, range.to_block
