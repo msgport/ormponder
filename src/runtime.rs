@@ -29,6 +29,8 @@ pub async fn run(run_once: bool) -> anyhow::Result<()> {
         config.finality_mode.as_str(),
     );
 
+    crate::metrics::record_configured_scopes(&config);
+
     let client = DatalensHttpClient::new(config.datalens.clone());
     let checkpoints = PostgresCheckpointStore::new(pool.clone());
     ensure_datalens_warmup_on_startup(&config, &checkpoints, &client).await?;
@@ -69,6 +71,8 @@ pub async fn run_with_server(listen_addr: &str) -> anyhow::Result<()> {
         config.finality_mode.as_str(),
         listen_addr,
     );
+
+    crate::metrics::record_configured_scopes(&config);
 
     let client = DatalensHttpClient::new(config.datalens.clone());
     let checkpoints = PostgresCheckpointStore::new(pool.clone());
