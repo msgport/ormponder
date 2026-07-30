@@ -8,8 +8,9 @@ use std::time::Duration;
 use tower::ServiceExt;
 
 use ormpindexer::{
+    config::MetricsConfig,
     database::{EventWriter, PostgresEventWriter, apply_migrations},
-    graphql::{build_router, build_schema},
+    graphql::{build_router, build_router_with_metrics_config, build_schema},
     schema::{ADDRESS_ORACLE, ADDRESS_RELAYER, ChainLogMetadata, EventSource, LegacyOrmPEvent},
 };
 
@@ -198,6 +199,8 @@ async fn test_status_and_metrics_expose_checkpoint_progress_from_postgres() {
     assert!(metrics_body.contains(
         "ormp_indexer_checkpoint_next_block{chain_id=\"46\",dataset=\"datalens-native\"} 123"
     ));
+    assert!(metrics_body.contains("ormp_metrics_refresh_success{} 1"));
+    assert!(metrics_body.contains("ormp_metrics_snapshot_stale{} 0"));
     assert!(metrics_body.contains(
         "ormp_indexer_checkpoint_next_block{chain_id=\"11155111\",dataset=\"datalens-native\"} 456"
     ));
@@ -207,6 +210,54 @@ async fn test_status_and_metrics_expose_checkpoint_progress_from_postgres() {
     assert!(
         metrics_body.contains("ormp_indexer_legacy_table_rows{table=\"ormp_message_assigned\"} 1")
     );
+}
+
+#[tokio::test]
+async fn test_metrics_endpoint_serves_cached_db_snapshot_between_refreshes() {
+    let Some(database_url) = test_database_url() else {
+        eprintln!("skipping metrics cache Postgres test; ORMPINDEXER_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect test postgres");
+    apply_migrations(&pool).await.expect("apply migrations");
+    truncate_tables(&pool).await;
+    seed_checkpoint_rows(&pool).await;
+
+    let app = build_router_with_metrics_config(
+        build_schema(pool.clone()),
+        pool.clone(),
+        MetricsConfig {
+            refresh_delay: Duration::from_secs(3600),
+            refresh_timeout: Duration::from_secs(10),
+        },
+    );
+
+    let first_body = metrics_body(app.clone()).await;
+    assert!(first_body.contains(
+        "ormp_indexer_checkpoint_next_block{chain_id=\"46\",dataset=\"datalens-native\"} 123"
+    ));
+
+    sqlx::query(
+        "UPDATE ormp_indexer_checkpoint
+         SET next_block = $1::NUMERIC
+         WHERE chain_id = $2::NUMERIC AND dataset = $3",
+    )
+    .bind("789")
+    .bind("46")
+    .bind("datalens-native")
+    .execute(&pool)
+    .await
+    .expect("update checkpoint");
+
+    let second_body = metrics_body(app).await;
+    assert!(second_body.contains(
+        "ormp_indexer_checkpoint_next_block{chain_id=\"46\",dataset=\"datalens-native\"} 123"
+    ));
+    assert!(!second_body.contains(
+        "ormp_indexer_checkpoint_next_block{chain_id=\"46\",dataset=\"datalens-native\"} 789"
+    ));
 }
 
 fn legacy_events() -> Vec<LegacyOrmPEvent> {
@@ -282,6 +333,27 @@ async fn truncate_tables(pool: &PgPool) {
     .execute(pool)
     .await
     .expect("truncate tables");
+}
+
+async fn metrics_body(app: axum::Router) -> String {
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .expect("metrics request"),
+        )
+        .await
+        .expect("metrics response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    String::from_utf8(
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body")
+            .to_vec(),
+    )
+    .expect("utf8 metrics")
 }
 
 fn content_type(headers: &HeaderMap) -> Option<&str> {

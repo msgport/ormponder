@@ -5,7 +5,7 @@ use crate::{
     database::{PostgresCheckpointStore, PostgresEventWriter, apply_migrations, connect},
     datalens::DatalensHttpClient,
     decoder::EvmEventDecoder,
-    graphql::{build_router, build_schema},
+    graphql::{build_router_with_metrics_config, build_schema},
     runner::IndexerRunner,
     warmup::ensure_startup_warmup,
 };
@@ -85,7 +85,8 @@ pub async fn run_with_server(listen_addr: &str) -> anyhow::Result<()> {
         EvmEventDecoder,
         PostgresEventWriter::new(pool.clone()),
     );
-    let app = build_router(build_schema(pool.clone()), pool);
+    let app =
+        build_router_with_metrics_config(build_schema(pool.clone()), pool, config.metrics.clone());
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await
         .with_context(|| format!("bind GraphQL server to {listen_addr}"))?;

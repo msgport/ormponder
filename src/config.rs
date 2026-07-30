@@ -11,6 +11,7 @@ use crate::{
 pub struct RuntimeConfig {
     pub datalens: DatalensConfig,
     pub warmup: DatalensWarmupConfig,
+    pub metrics: MetricsConfig,
     pub database_url: Option<SecretString>,
     pub enabled_chains: Vec<ChainConfig>,
     pub batch_size: u64,
@@ -95,6 +96,7 @@ impl RuntimeConfig {
         {
             bail!("ORMPINDEXER_REORG_WINDOW_BLOCKS must be greater than zero");
         }
+        let metrics = MetricsConfig::from_env_map(env)?;
 
         Ok(Self {
             datalens: DatalensConfig {
@@ -120,6 +122,7 @@ impl RuntimeConfig {
                 chunk_size: warmup_chunk_size,
                 end_block: optional_u64(env, "ORMPINDEXER_DATALENS_WARMUP_END_BLOCK")?,
             },
+            metrics,
             database_url: optional_env(env, "ORMPINDEXER_DATABASE_URL").map(SecretString::new),
             enabled_chains,
             batch_size,
@@ -136,6 +139,46 @@ impl RuntimeConfig {
         self.enabled_chains
             .iter()
             .find(|chain| chain.chain_id == chain_id)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MetricsConfig {
+    pub refresh_delay: Duration,
+    pub refresh_timeout: Duration,
+}
+
+impl MetricsConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        let env = env::vars().collect::<BTreeMap<_, _>>();
+        Self::from_env_map(&env)
+    }
+
+    pub fn from_env_map(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        let refresh_delay_ms =
+            optional_u64(env, "ORMPINDEXER_METRICS_REFRESH_DELAY_MS")?.unwrap_or(5_000);
+        if refresh_delay_ms == 0 {
+            bail!("ORMPINDEXER_METRICS_REFRESH_DELAY_MS must be greater than zero");
+        }
+        let refresh_timeout_ms =
+            optional_u64(env, "ORMPINDEXER_METRICS_REFRESH_TIMEOUT_MS")?.unwrap_or(10_000);
+        if refresh_timeout_ms == 0 {
+            bail!("ORMPINDEXER_METRICS_REFRESH_TIMEOUT_MS must be greater than zero");
+        }
+
+        Ok(Self {
+            refresh_delay: Duration::from_millis(refresh_delay_ms),
+            refresh_timeout: Duration::from_millis(refresh_timeout_ms),
+        })
+    }
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            refresh_delay: Duration::from_secs(5),
+            refresh_timeout: Duration::from_secs(10),
+        }
     }
 }
 
